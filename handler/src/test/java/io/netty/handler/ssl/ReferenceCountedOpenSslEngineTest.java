@@ -15,11 +15,18 @@
  */
 package io.netty.handler.ssl;
 
+import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.util.ReferenceCountUtil;
+import org.junit.Test;
 
 import javax.net.ssl.SSLEngine;
 
 public class ReferenceCountedOpenSslEngineTest extends OpenSslEngineTest {
+
+    public ReferenceCountedOpenSslEngineTest(BufferType type, ProtocolCipherCombo combo) {
+        super(type, combo);
+    }
+
     @Override
     protected SslProvider sslClientProvider() {
         return SslProvider.OPENSSL_REFCNT;
@@ -48,5 +55,17 @@ public class ReferenceCountedOpenSslEngineTest extends OpenSslEngineTest {
     @Override
     protected void cleanupServerSslEngine(SSLEngine engine) {
         ReferenceCountUtil.release(engine);
+    }
+
+    @Test(expected = NullPointerException.class)
+    public void testNotLeakOnException() throws Exception {
+        clientSslCtx = SslContextBuilder.forClient()
+                                        .trustManager(InsecureTrustManagerFactory.INSTANCE)
+                                        .sslProvider(sslClientProvider())
+                                        .protocols(protocols())
+                                        .ciphers(ciphers())
+                                        .build();
+
+        clientSslCtx.newEngine(null);
     }
 }

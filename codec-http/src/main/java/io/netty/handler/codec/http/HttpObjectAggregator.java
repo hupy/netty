@@ -30,6 +30,7 @@ import io.netty.util.internal.logging.InternalLoggerFactory;
 
 import static io.netty.handler.codec.http.HttpHeaderNames.CONNECTION;
 import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
+import static io.netty.handler.codec.http.HttpHeaderNames.EXPECT;
 import static io.netty.handler.codec.http.HttpUtil.getContentLength;
 
 /**
@@ -151,20 +152,39 @@ public class HttpObjectAggregator
 
     @Override
     protected boolean isContentLengthInvalid(HttpMessage start, int maxContentLength) {
-        return getContentLength(start, -1L) > maxContentLength;
+        try {
+            return getContentLength(start, -1L) > maxContentLength;
+        } catch (final NumberFormatException e) {
+            return false;
+        }
+    }
+
+    private static Object continueResponse(HttpMessage start, int maxContentLength, ChannelPipeline pipeline) {
+        if (HttpUtil.isUnsupportedExpectation(start)) {
+            // if the request contains an unsupported expectation, we return 417
+            pipeline.fireUserEventTriggered(HttpExpectationFailedEvent.INSTANCE);
+            return EXPECTATION_FAILED.retainedDuplicate();
+        } else if (HttpUtil.is100ContinueExpected(start)) {
+            // if the request contains 100-continue but the content-length is too large, we return 413
+            if (getContentLength(start, -1L) <= maxContentLength) {
+                return CONTINUE.retainedDuplicate();
+            }
+            pipeline.fireUserEventTriggered(HttpExpectationFailedEvent.INSTANCE);
+            return TOO_LARGE.retainedDuplicate();
+        }
+
+        return null;
     }
 
     @Override
     protected Object newContinueResponse(HttpMessage start, int maxContentLength, ChannelPipeline pipeline) {
-        if (HttpUtil.is100ContinueExpected(start)) {
-            if (getContentLength(start, -1L) <= maxContentLength) {
-                return CONTINUE.retainedDuplicate();
-            }
-
-            pipeline.fireUserEventTriggered(HttpExpectationFailedEvent.INSTANCE);
-            return EXPECTATION_FAILED.retainedDuplicate();
+        Object response = continueResponse(start, maxContentLength, pipeline);
+        // we're going to respond based on the request expectation so there's no
+        // need to propagate the expectation further.
+        if (response != null) {
+            start.headers().remove(EXPECT);
         }
-        return null;
+        return response;
     }
 
     @Override
@@ -174,8 +194,11 @@ public class HttpObjectAggregator
 
     @Override
     protected boolean ignoreContentAfterContinueResponse(Object msg) {
-        return msg instanceof HttpResponse &&
-               ((HttpResponse) msg).status().code() == HttpResponseStatus.EXPECTATION_FAILED.code();
+        if (msg instanceof HttpResponse) {
+            final HttpResponse httpResponse = (HttpResponse) msg;
+            return httpResponse.status().codeClass().equals(HttpStatusClass.CLIENT_ERROR);
+        }
+        return false;
     }
 
     @Override
@@ -401,9 +424,9 @@ public class HttpObjectAggregator
 
         @Override
         public FullHttpRequest replace(ByteBuf content) {
-            DefaultFullHttpRequest dup = new DefaultFullHttpRequest(protocolVersion(), method(), uri(), content);
-            dup.headers().set(headers());
-            dup.trailingHeaders().set(trailingHeaders());
+            DefaultFullHttpRequest dup = new DefaultFullHttpRequest(protocolVersion(), method(), uri(), content,
+                    headers().copy(), trailingHeaders().copy());
+            dup.setDecoderResult(decoderResult());
             return dup;
         }
 
@@ -499,9 +522,9 @@ public class HttpObjectAggregator
 
         @Override
         public FullHttpResponse replace(ByteBuf content) {
-            DefaultFullHttpResponse dup = new DefaultFullHttpResponse(getProtocolVersion(), getStatus(), content);
-            dup.headers().set(headers());
-            dup.trailingHeaders().set(trailingHeaders());
+            DefaultFullHttpResponse dup = new DefaultFullHttpResponse(getProtocolVersion(), getStatus(), content,
+                    headers().copy(), trailingHeaders().copy());
+            dup.setDecoderResult(decoderResult());
             return dup;
         }
 

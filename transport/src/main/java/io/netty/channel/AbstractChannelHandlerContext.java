@@ -189,8 +189,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
 
     @Override
     public ChannelHandlerContext fireChannelActive() {
-        final AbstractChannelHandlerContext next = findContextInbound();
-        invokeChannelActive(next);
+        invokeChannelActive(findContextInbound());
         return this;
     }
 
@@ -476,7 +475,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         if (localAddress == null) {
             throw new NullPointerException("localAddress");
         }
-        if (!validatePromise(promise, false)) {
+        if (isNotValidPromise(promise, false)) {
             // cancelled
             return promise;
         }
@@ -520,7 +519,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         if (remoteAddress == null) {
             throw new NullPointerException("remoteAddress");
         }
-        if (!validatePromise(promise, false)) {
+        if (isNotValidPromise(promise, false)) {
             // cancelled
             return promise;
         }
@@ -554,7 +553,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
 
     @Override
     public ChannelFuture disconnect(final ChannelPromise promise) {
-        if (!validatePromise(promise, false)) {
+        if (isNotValidPromise(promise, false)) {
             // cancelled
             return promise;
         }
@@ -598,7 +597,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
 
     @Override
     public ChannelFuture close(final ChannelPromise promise) {
-        if (!validatePromise(promise, false)) {
+        if (isNotValidPromise(promise, false)) {
             // cancelled
             return promise;
         }
@@ -633,7 +632,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
 
     @Override
     public ChannelFuture deregister(final ChannelPromise promise) {
-        if (!validatePromise(promise, false)) {
+        if (isNotValidPromise(promise, false)) {
             // cancelled
             return promise;
         }
@@ -712,7 +711,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         }
 
         try {
-            if (!validatePromise(promise, true)) {
+            if (isNotValidPromise(promise, true)) {
                 ReferenceCountUtil.release(msg);
                 // cancelled
                 return promise;
@@ -786,7 +785,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             throw new NullPointerException("msg");
         }
 
-        if (!validatePromise(promise, true)) {
+        if (isNotValidPromise(promise, true)) {
             ReferenceCountUtil.release(msg);
             // cancelled
             return promise;
@@ -817,13 +816,19 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
                 next.invokeWrite(m, promise);
             }
         } else {
-            AbstractWriteTask task;
+            final AbstractWriteTask task;
             if (flush) {
                 task = WriteAndFlushTask.newInstance(next, m, promise);
             }  else {
                 task = WriteTask.newInstance(next, m, promise);
             }
-            safeExecute(executor, task, promise, m);
+            if (!safeExecute(executor, task, promise, m)) {
+                // We failed to submit the AbstractWriteTask. We need to cancel it so we decrement the pending bytes
+                // and put it back in the Recycler for re-use later.
+                //
+                // See https://github.com/netty/netty/issues/8343.
+                task.cancel();
+            }
         }
     }
 
@@ -833,9 +838,9 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
     }
 
     private static void notifyOutboundHandlerException(Throwable cause, ChannelPromise promise) {
-        if (!(promise instanceof VoidChannelPromise)) {
-            PromiseNotificationUtil.tryFailure(promise, cause, logger);
-        }
+        // Only log if the given promise is not of type VoidChannelPromise as tryFailure(...) is expected to return
+        // false.
+        PromiseNotificationUtil.tryFailure(promise, cause, promise instanceof VoidChannelPromise ? null : logger);
     }
 
     private void notifyHandlerException(Throwable cause) {
@@ -895,7 +900,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         return new FailedChannelFuture(channel(), executor(), cause);
     }
 
-    private boolean validatePromise(ChannelPromise promise, boolean allowVoidPromise) {
+    private boolean isNotValidPromise(ChannelPromise promise, boolean allowVoidPromise) {
         if (promise == null) {
             throw new NullPointerException("promise");
         }
@@ -906,7 +911,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             //
             // See https://github.com/netty/netty/issues/2349
             if (promise.isCancelled()) {
-                return false;
+                return true;
             }
             throw new IllegalArgumentException("promise already done: " + promise);
         }
@@ -917,7 +922,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         }
 
         if (promise.getClass() == DefaultChannelPromise.class) {
-            return true;
+            return false;
         }
 
         if (!allowVoidPromise && promise instanceof VoidChannelPromise) {
@@ -929,7 +934,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             throw new IllegalArgumentException(
                     StringUtil.simpleClassName(AbstractChannel.CloseFuture.class) + " not allowed in a pipeline");
         }
-        return true;
+        return false;
     }
 
     private AbstractChannelHandlerContext findContextInbound() {
@@ -957,14 +962,17 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         handlerState = REMOVE_COMPLETE;
     }
 
-    final void setAddComplete() {
+    final boolean setAddComplete() {
         for (;;) {
             int oldState = handlerState;
+            if (oldState == REMOVE_COMPLETE) {
+                return false;
+            }
             // Ensure we never update when the handlerState is REMOVE_COMPLETE already.
             // oldState is usually ADD_PENDING but can also be REMOVE_COMPLETE when an EventExecutor is used that is not
             // exposing ordering guarantees.
-            if (oldState == REMOVE_COMPLETE || HANDLER_STATE_UPDATER.compareAndSet(this, oldState, ADD_COMPLETE)) {
-                return;
+            if (HANDLER_STATE_UPDATER.compareAndSet(this, oldState, ADD_COMPLETE)) {
+                return true;
             }
         }
     }
@@ -974,11 +982,31 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         assert updated; // This should always be true as it MUST be called before setAddComplete() or setRemoved().
     }
 
+    final void callHandlerAdded() throws Exception {
+        // We must call setAddComplete before calling handlerAdded. Otherwise if the handlerAdded method generates
+        // any pipeline events ctx.handler() will miss them because the state will not allow it.
+        if (setAddComplete()) {
+            handler().handlerAdded(this);
+        }
+    }
+
+    final void callHandlerRemoved() throws Exception {
+        try {
+            // Only call handlerRemoved(...) if we called handlerAdded(...) before.
+            if (handlerState == ADD_COMPLETE) {
+                handler().handlerRemoved(this);
+            }
+        } finally {
+            // Mark the handler as removed in any case.
+            setRemoved();
+        }
+    }
+
     /**
      * Makes best possible effort to detect if {@link ChannelHandler#handlerAdded(ChannelHandlerContext)} was called
      * yet. If not return {@code false} and if called or could not detect return {@code true}.
      *
-     * If this method returns {@code true} we will not invoke the {@link ChannelHandler} but just forward the event.
+     * If this method returns {@code false} we will not invoke the {@link ChannelHandler} but just forward the event.
      * This is needed as {@link DefaultChannelPipeline} may already put the {@link ChannelHandler} in the linked-list
      * but not called {@link ChannelHandler#handlerAdded(ChannelHandlerContext)}.
      */
@@ -1003,9 +1031,10 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         return channel().hasAttr(key);
     }
 
-    private static void safeExecute(EventExecutor executor, Runnable runnable, ChannelPromise promise, Object msg) {
+    private static boolean safeExecute(EventExecutor executor, Runnable runnable, ChannelPromise promise, Object msg) {
         try {
             executor.execute(runnable);
+            return true;
         } catch (Throwable cause) {
             try {
                 promise.setFailure(cause);
@@ -1014,6 +1043,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
                     ReferenceCountUtil.release(msg);
                 }
             }
+            return false;
         }
     }
 
@@ -1054,15 +1084,8 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             task.promise = promise;
 
             if (ESTIMATE_TASK_SIZE_ON_SUBMIT) {
-                ChannelOutboundBuffer buffer = ctx.channel().unsafe().outboundBuffer();
-
-                // Check for null as it may be set to null if the channel is closed already
-                if (buffer != null) {
-                    task.size = ctx.pipeline.estimatorHandle().size(msg) + WRITE_TASK_OVERHEAD;
-                    buffer.incrementPendingOutboundBytes(task.size);
-                } else {
-                    task.size = 0;
-                }
+                task.size = ctx.pipeline.estimatorHandle().size(msg) + WRITE_TASK_OVERHEAD;
+                ctx.pipeline.incrementPendingOutboundBytes(task.size);
             } else {
                 task.size = 0;
             }
@@ -1071,19 +1094,33 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
         @Override
         public final void run() {
             try {
-                ChannelOutboundBuffer buffer = ctx.channel().unsafe().outboundBuffer();
-                // Check for null as it may be set to null if the channel is closed already
-                if (ESTIMATE_TASK_SIZE_ON_SUBMIT && buffer != null) {
-                    buffer.decrementPendingOutboundBytes(size);
-                }
+                decrementPendingOutboundBytes();
                 write(ctx, msg, promise);
             } finally {
-                // Set to null so the GC can collect them directly
-                ctx = null;
-                msg = null;
-                promise = null;
-                handle.recycle(this);
+                recycle();
             }
+        }
+
+        void cancel() {
+            try {
+                decrementPendingOutboundBytes();
+            } finally {
+                recycle();
+            }
+        }
+
+        private void decrementPendingOutboundBytes() {
+            if (ESTIMATE_TASK_SIZE_ON_SUBMIT) {
+                ctx.pipeline.decrementPendingOutboundBytes(size);
+            }
+        }
+
+        private void recycle() {
+            // Set to null so the GC can collect them directly
+            ctx = null;
+            msg = null;
+            promise = null;
+            handle.recycle(this);
         }
 
         protected void write(AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
@@ -1100,7 +1137,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             }
         };
 
-        private static WriteTask newInstance(
+        static WriteTask newInstance(
                 AbstractChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
             WriteTask task = RECYCLER.get();
             init(task, ctx, msg, promise);
@@ -1121,7 +1158,7 @@ abstract class AbstractChannelHandlerContext extends DefaultAttributeMap
             }
         };
 
-        private static WriteAndFlushTask newInstance(
+        static WriteAndFlushTask newInstance(
                 AbstractChannelHandlerContext ctx, Object msg,  ChannelPromise promise) {
             WriteAndFlushTask task = RECYCLER.get();
             init(task, ctx, msg, promise);

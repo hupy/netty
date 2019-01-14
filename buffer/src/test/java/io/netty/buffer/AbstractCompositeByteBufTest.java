@@ -16,6 +16,8 @@
 package io.netty.buffer;
 
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.internal.PlatformDependent;
+import org.junit.Assume;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
@@ -50,6 +52,8 @@ import static org.junit.Assert.fail;
  */
 public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
 
+    private static final ByteBufAllocator ALLOC = UnpooledByteBufAllocator.DEFAULT;
+
     private final ByteOrder order;
 
     protected AbstractCompositeByteBufTest(ByteOrder order) {
@@ -60,7 +64,9 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
     }
 
     @Override
-    protected ByteBuf newBuffer(int length) {
+    protected ByteBuf newBuffer(int length, int maxCapacity) {
+        Assume.assumeTrue(maxCapacity == Integer.MAX_VALUE);
+
         List<ByteBuf> buffers = new ArrayList<ByteBuf>();
         for (int i = 0; i < length + 45; i += 45) {
             buffers.add(EMPTY_BUFFER);
@@ -84,7 +90,7 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
             buffers.add(EMPTY_BUFFER);
         }
 
-        ByteBuf buffer = wrappedBuffer(Integer.MAX_VALUE, buffers.toArray(new ByteBuf[buffers.size()])).order(order);
+        ByteBuf buffer = wrappedBuffer(Integer.MAX_VALUE, buffers.toArray(new ByteBuf[0])).order(order);
 
         // Truncate to the requested capacity.
         buffer.capacity(length);
@@ -1001,8 +1007,7 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
         CompositeByteBuf cbuf = compositeBuffer();
         ByteBuf buf1 = buffer().writeByte((byte) 1);
         cbuf.addComponent(true, buf1);
-        ByteBuf buf2 = EMPTY_BUFFER;
-        cbuf.addComponent(true, buf2);
+        cbuf.addComponent(true, EMPTY_BUFFER);
         ByteBuf buf3 = buffer().writeByte((byte) 2);
         cbuf.addComponent(true, buf3);
 
@@ -1012,6 +1017,33 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
 
         assertSame(EMPTY_BUFFER, cbuf.internalComponent(1));
         assertNotSame(EMPTY_BUFFER, cbuf.internalComponentAtOffset(1));
+        cbuf.release();
+    }
+
+    @Test
+    public void testInsertEmptyBufferInMiddle() {
+        CompositeByteBuf cbuf = compositeBuffer();
+        ByteBuf buf1 = buffer().writeByte((byte) 1);
+        cbuf.addComponent(true, buf1);
+        ByteBuf buf2 = buffer().writeByte((byte) 2);
+        cbuf.addComponent(true, buf2);
+
+        // insert empty one between the first two
+        cbuf.addComponent(true, 1, EMPTY_BUFFER);
+
+        assertEquals(2, cbuf.readableBytes());
+        assertEquals((byte) 1, cbuf.readByte());
+        assertEquals((byte) 2, cbuf.readByte());
+
+        assertEquals(2, cbuf.capacity());
+        assertEquals(3, cbuf.numComponents());
+
+        byte[] dest = new byte[2];
+        // should skip over the empty one, not throw a java.lang.Error :)
+        cbuf.getBytes(0, dest);
+
+        assertArrayEquals(new byte[] {1, 2}, dest);
+
         cbuf.release();
     }
 
@@ -1101,17 +1133,166 @@ public abstract class AbstractCompositeByteBufTest extends AbstractByteBufTest {
             .addComponents(s2, s3, s4)
             .order(ByteOrder.LITTLE_ENDIAN);
 
-        assertEquals(composite.refCnt(), 1);
-        assertEquals(buffer.refCnt(), 5);
+        assertEquals(1, composite.refCnt());
+        assertEquals(5, buffer.refCnt());
 
         // releasing composite should release the 4 components
         ReferenceCountUtil.release(composite);
-        assertEquals(composite.refCnt(), 0);
-        assertEquals(buffer.refCnt(), 1);
+        assertEquals(0, composite.refCnt());
+        assertEquals(1, buffer.refCnt());
 
         // last remaining ref to buffer
         ReferenceCountUtil.release(buffer);
-        assertEquals(buffer.refCnt(), 0);
+        assertEquals(0, buffer.refCnt());
+    }
+
+    @Test
+    public void testReleasesItsComponents2() {
+        // It is important to use a pooled allocator here to ensure
+        // the slices returned by readRetainedSlice are of type
+        // PooledSlicedByteBuf, which maintains an independent refcount
+        // (so that we can be sure to cover this case)
+        ByteBuf buffer = PooledByteBufAllocator.DEFAULT.buffer(); // 1
+
+        buffer.writeBytes(new byte[] {1, 2, 3, 4, 5, 6, 7, 8, 9, 10});
+
+        // use readRetainedSlice this time - produces different kind of slices
+        ByteBuf s1 = buffer.readRetainedSlice(2); // 2
+        ByteBuf s2 = s1.readRetainedSlice(2); // 3
+        ByteBuf s3 = s2.readRetainedSlice(2); // 4
+        ByteBuf s4 = s3.readRetainedSlice(2); // 5
+
+        ByteBuf composite = Unpooled.compositeBuffer()
+            .addComponent(s1)
+            .addComponents(s2, s3, s4)
+            .order(ByteOrder.LITTLE_ENDIAN);
+
+        assertEquals(1, composite.refCnt());
+        assertEquals(2, buffer.refCnt());
+
+        // releasing composite should release the 4 components
+        composite.release();
+        assertEquals(0, composite.refCnt());
+        assertEquals(1, buffer.refCnt());
+
+        // last remaining ref to buffer
+        buffer.release();
+        assertEquals(0, buffer.refCnt());
+    }
+
+    @Test
+    public void testReleasesOnShrink() {
+
+        ByteBuf b1 = Unpooled.buffer(2).writeShort(1);
+        ByteBuf b2 = Unpooled.buffer(2).writeShort(2);
+
+        // composite takes ownership of s1 and s2
+        ByteBuf composite = Unpooled.compositeBuffer()
+            .addComponents(b1, b2);
+
+        assertEquals(4, composite.capacity());
+
+        // reduce capacity down to two, will drop the second component
+        composite.capacity(2);
+        assertEquals(2, composite.capacity());
+
+        // releasing composite should release the components
+        composite.release();
+        assertEquals(0, composite.refCnt());
+        assertEquals(0, b1.refCnt());
+        assertEquals(0, b2.refCnt());
+    }
+
+    @Test
+    public void testAllocatorIsSameWhenCopy() {
+        testAllocatorIsSameWhenCopy(false);
+    }
+
+    @Test
+    public void testAllocatorIsSameWhenCopyUsingIndexAndLength() {
+        testAllocatorIsSameWhenCopy(true);
+    }
+
+    private void testAllocatorIsSameWhenCopy(boolean withIndexAndLength) {
+        ByteBuf buffer = newBuffer(8);
+        buffer.writeZero(4);
+        ByteBuf copy = withIndexAndLength ? buffer.copy(0, 4) : buffer.copy();
+        assertEquals(buffer, copy);
+        assertEquals(buffer.isDirect(), copy.isDirect());
+        assertSame(buffer.alloc(), copy.alloc());
+        buffer.release();
+        copy.release();
+    }
+
+    @Test
+    public void testDecomposeMultiple() {
+        testDecompose(150, 500, 3);
+    }
+
+    @Test
+    public void testDecomposeOne() {
+        testDecompose(310, 50, 1);
+    }
+
+    @Test
+    public void testDecomposeNone() {
+        testDecompose(310, 0, 0);
+    }
+
+    private static void testDecompose(int offset, int length, int expectedListSize) {
+        byte[] bytes = new byte[1024];
+        PlatformDependent.threadLocalRandom().nextBytes(bytes);
+        ByteBuf buf = wrappedBuffer(bytes);
+
+        CompositeByteBuf composite = compositeBuffer();
+        composite.addComponents(true,
+                                buf.retainedSlice(100, 200),
+                                buf.retainedSlice(300, 400),
+                                buf.retainedSlice(700, 100));
+
+        ByteBuf slice = composite.slice(offset, length);
+        List<ByteBuf> bufferList = composite.decompose(offset, length);
+        assertEquals(expectedListSize, bufferList.size());
+        ByteBuf wrapped = wrappedBuffer(bufferList.toArray(new ByteBuf[0]));
+
+        assertEquals(slice, wrapped);
+        composite.release();
+        buf.release();
+
+        for (ByteBuf buffer: bufferList) {
+            assertEquals(0, buffer.refCnt());
+        }
+    }
+
+    @Test
+    public void testComponentsLessThanLowerBound() {
+        try {
+            new CompositeByteBuf(ALLOC, true, 0);
+            fail();
+        } catch (IllegalArgumentException e) {
+            assertEquals("maxNumComponents: 0 (expected: >= 1)", e.getMessage());
+        }
+    }
+
+    @Test
+    public void testComponentsEqualToLowerBound() {
+        assertCompositeBufCreated(1);
+    }
+
+    @Test
+    public void testComponentsGreaterThanLowerBound() {
+        assertCompositeBufCreated(5);
+    }
+
+    /**
+     * Assert that a new {@linkplain CompositeByteBuf} was created successfully with the desired number of max
+     * components.
+     */
+    private static void assertCompositeBufCreated(int expectedMaxComponents) {
+        CompositeByteBuf buf = new CompositeByteBuf(ALLOC, true, expectedMaxComponents);
+
+        assertEquals(expectedMaxComponents, buf.maxNumComponents());
+        assertTrue(buf.release());
     }
 
 }

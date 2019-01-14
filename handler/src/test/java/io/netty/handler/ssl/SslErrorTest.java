@@ -117,16 +117,17 @@ public class SslErrorTest {
         this.exception = exception;
     }
 
-    @Test(timeout = 10000L)
+    @Test(timeout = 30000)
     public void testCorrectAlert() throws Exception {
         // As this only works correctly at the moment when OpenSslEngine is used on the server-side there is
         // no need to run it if there is no openssl is available at all.
         Assume.assumeTrue(OpenSsl.isAvailable());
 
         SelfSignedCertificate ssc = new SelfSignedCertificate();
-        final SslContext sslServerCtx = SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
-                .sslProvider(serverProvider)
-                .trustManager(new SimpleTrustManagerFactory() {
+        final SslContext sslServerCtx =
+                SslContextBuilder.forServer(ssc.certificate(), ssc.privateKey())
+                                 .sslProvider(serverProvider)
+                                 .trustManager(new SimpleTrustManagerFactory() {
             @Override
             protected void engineInit(KeyStore keyStore) { }
             @Override
@@ -203,14 +204,24 @@ public class SslErrorTest {
                                             if (reason == CertPathValidatorException.BasicReason.EXPIRED) {
                                                 verifyException(unwrappedCause, "expired", promise);
                                             } else if (reason == CertPathValidatorException.BasicReason.NOT_YET_VALID) {
-                                                verifyException(unwrappedCause, "bad", promise);
+                                                // BoringSSL uses "expired" in this case while others use "bad"
+                                                if (OpenSsl.isBoringSSL()) {
+                                                    verifyException(unwrappedCause, "expired", promise);
+                                                } else {
+                                                    verifyException(unwrappedCause, "bad", promise);
+                                                }
                                             } else if (reason == CertPathValidatorException.BasicReason.REVOKED) {
                                                 verifyException(unwrappedCause, "revoked", promise);
                                             }
                                         } else if (exception instanceof CertificateExpiredException) {
                                             verifyException(unwrappedCause, "expired", promise);
                                         } else if (exception instanceof CertificateNotYetValidException) {
-                                            verifyException(unwrappedCause, "bad", promise);
+                                            // BoringSSL uses "expired" in this case while others use "bad"
+                                            if (OpenSsl.isBoringSSL()) {
+                                                verifyException(unwrappedCause, "expired", promise);
+                                            } else {
+                                                verifyException(unwrappedCause, "bad", promise);
+                                            }
                                         } else if (exception instanceof CertificateRevokedException) {
                                             verifyException(unwrappedCause, "revoked", promise);
                                         }
@@ -242,11 +253,14 @@ public class SslErrorTest {
         if (message.toLowerCase(Locale.UK).contains(messagePart.toLowerCase(Locale.UK))) {
             promise.setSuccess(null);
         } else {
-            promise.setFailure(new AssertionError("message not contains '" + messagePart + "': " + message));
+            Throwable error = new AssertionError("message not contains '" + messagePart + "': " + message);
+            error.initCause(cause);
+            promise.setFailure(error);
         }
     }
 
     private static final class TestCertificateException extends CertificateException {
+        private static final long serialVersionUID = -5816338303868751410L;
 
         public TestCertificateException(Throwable cause) {
             super(cause);

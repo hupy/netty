@@ -29,8 +29,8 @@ import static io.netty.channel.ChannelOption.AUTO_READ;
 import static io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS;
 import static io.netty.channel.ChannelOption.MAX_MESSAGES_PER_READ;
 import static io.netty.channel.ChannelOption.MESSAGE_SIZE_ESTIMATOR;
-import static io.netty.channel.ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP;
 import static io.netty.channel.ChannelOption.RCVBUF_ALLOCATOR;
+import static io.netty.channel.ChannelOption.SINGLE_EVENTEXECUTOR_PER_GROUP;
 import static io.netty.channel.ChannelOption.WRITE_BUFFER_HIGH_WATER_MARK;
 import static io.netty.channel.ChannelOption.WRITE_BUFFER_LOW_WATER_MARK;
 import static io.netty.channel.ChannelOption.WRITE_BUFFER_WATER_MARK;
@@ -265,6 +265,13 @@ public class DefaultChannelConfig implements ChannelConfig {
             throw new IllegalArgumentException(
                     "writeSpinCount must be a positive integer.");
         }
+        // Integer.MAX_VALUE is used as a special value in the channel implementations to indicate the channel cannot
+        // accept any more data, and results in the writeOp being set on the selector (or execute a runnable which tries
+        // to flush later because the writeSpinCount quantum has been exhausted). This strategy prevents additional
+        // conditional logic in the channel implementations, and shouldn't be noticeable in practice.
+        if (writeSpinCount == Integer.MAX_VALUE) {
+            --writeSpinCount;
+        }
         this.writeSpinCount = writeSpinCount;
         return this;
     }
@@ -307,7 +314,7 @@ public class DefaultChannelConfig implements ChannelConfig {
         } else if (allocator == null) {
             throw new NullPointerException("allocator");
         }
-        rcvBufAllocator = allocator;
+        setRecvByteBufAllocator(allocator);
     }
 
     @Override

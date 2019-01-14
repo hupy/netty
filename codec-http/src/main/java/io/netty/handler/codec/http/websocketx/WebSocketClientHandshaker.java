@@ -33,11 +33,13 @@ import io.netty.handler.codec.http.HttpRequestEncoder;
 import io.netty.handler.codec.http.HttpResponse;
 import io.netty.handler.codec.http.HttpResponseDecoder;
 import io.netty.handler.codec.http.HttpScheme;
+import io.netty.util.NetUtil;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.internal.ThrowableUtil;
 
 import java.net.URI;
 import java.nio.channels.ClosedChannelException;
+import java.util.Locale;
 
 /**
  * Base class for web socket client handshake implementations
@@ -45,6 +47,9 @@ import java.nio.channels.ClosedChannelException;
 public abstract class WebSocketClientHandshaker {
     private static final ClosedChannelException CLOSED_CHANNEL_EXCEPTION = ThrowableUtil.unknownStackTrace(
             new ClosedChannelException(), WebSocketClientHandshaker.class, "processHandshake(...)");
+
+    private static final String HTTP_SCHEME_PREFIX = HttpScheme.HTTP + "://";
+    private static final String HTTPS_SCHEME_PREFIX = HttpScheme.HTTPS + "://";
 
     private final URI uri;
 
@@ -383,7 +388,7 @@ public abstract class WebSocketClientHandshaker {
     }
 
     /**
-     * Verfiy the {@link FullHttpResponse} and throws a {@link WebSocketHandshakeException} if something is wrong.
+     * Verify the {@link FullHttpResponse} and throws a {@link WebSocketHandshakeException} if something is wrong.
      */
     protected abstract void verify(FullHttpResponse response);
 
@@ -442,25 +447,52 @@ public abstract class WebSocketClientHandshaker {
         return path == null || path.isEmpty() ? "/" : path;
     }
 
-    static int websocketPort(URI wsURL) {
-        // Format request
-        int wsPort = wsURL.getPort();
-        // check if the URI contained a port if not set the correct one depending on the schema.
-        // See https://github.com/netty/netty/pull/1558
-        if (wsPort == -1) {
-            return "wss".equals(wsURL.getScheme()) ? HttpScheme.HTTPS.port() : HttpScheme.HTTP.port();
+    static CharSequence websocketHostValue(URI wsURL) {
+        int port = wsURL.getPort();
+        if (port == -1) {
+            return wsURL.getHost();
         }
-        return wsPort;
+        String host = wsURL.getHost();
+        if (port == HttpScheme.HTTP.port()) {
+            return HttpScheme.HTTP.name().contentEquals(wsURL.getScheme())
+                    || WebSocketScheme.WS.name().contentEquals(wsURL.getScheme()) ?
+                    host : NetUtil.toSocketAddressString(host, port);
+        }
+        if (port == HttpScheme.HTTPS.port()) {
+            return HttpScheme.HTTPS.name().contentEquals(wsURL.getScheme())
+                    || WebSocketScheme.WSS.name().contentEquals(wsURL.getScheme()) ?
+                    host : NetUtil.toSocketAddressString(host, port);
+        }
+
+        // if the port is not standard (80/443) its needed to add the port to the header.
+        // See http://tools.ietf.org/html/rfc6454#section-6.2
+        return NetUtil.toSocketAddressString(host, port);
     }
 
-    static CharSequence websocketOriginValue(String host, int wsPort) {
-        String originValue = (wsPort == HttpScheme.HTTPS.port() ?
-                HttpScheme.HTTPS.name() : HttpScheme.HTTP.name()) + "://" + host;
-        if (wsPort != HttpScheme.HTTP.port() && wsPort != HttpScheme.HTTPS.port()) {
+    static CharSequence websocketOriginValue(URI wsURL) {
+        String scheme = wsURL.getScheme();
+        final String schemePrefix;
+        int port = wsURL.getPort();
+        final int defaultPort;
+        if (WebSocketScheme.WSS.name().contentEquals(scheme)
+            || HttpScheme.HTTPS.name().contentEquals(scheme)
+            || (scheme == null && port == WebSocketScheme.WSS.port())) {
+
+            schemePrefix = HTTPS_SCHEME_PREFIX;
+            defaultPort = WebSocketScheme.WSS.port();
+        } else {
+            schemePrefix = HTTP_SCHEME_PREFIX;
+            defaultPort = WebSocketScheme.WS.port();
+        }
+
+        // Convert uri-host to lower case (by RFC 6454, chapter 4 "Origin of a URI")
+        String host = wsURL.getHost().toLowerCase(Locale.US);
+
+        if (port != defaultPort && port != -1) {
             // if the port is not standard (80/443) its needed to add the port to the header.
             // See http://tools.ietf.org/html/rfc6454#section-6.2
-            return originValue + ':' + wsPort;
+            return schemePrefix + NetUtil.toSocketAddressString(host, port);
         }
-        return originValue;
+        return schemePrefix + host;
     }
 }

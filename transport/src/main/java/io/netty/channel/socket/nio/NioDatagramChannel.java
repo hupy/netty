@@ -30,8 +30,10 @@ import io.netty.channel.nio.AbstractNioMessageChannel;
 import io.netty.channel.socket.DatagramChannelConfig;
 import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.InternetProtocolFamily;
+import io.netty.util.internal.SocketUtils;
 import io.netty.util.internal.PlatformDependent;
 import io.netty.util.internal.StringUtil;
+import io.netty.util.internal.UnstableApi;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -193,7 +195,7 @@ public final class NioDatagramChannel
 
     private void doBind0(SocketAddress localAddress) throws Exception {
         if (PlatformDependent.javaVersion() >= 7) {
-            javaChannel().bind(localAddress);
+            SocketUtils.bind(javaChannel(), localAddress);
         } else {
             javaChannel().socket().bind(localAddress);
         }
@@ -284,7 +286,8 @@ public final class NioDatagramChannel
             return true;
         }
 
-        final ByteBuffer nioData = data.internalNioBuffer(data.readerIndex(), dataLen);
+        final ByteBuffer nioData = data.nioBufferCount() == 1 ? data.internalNioBuffer(data.readerIndex(), dataLen)
+                                                              : data.nioBuffer(data.readerIndex(), dataLen);
         final int writtenBytes;
         if (remoteAddress != null) {
             writtenBytes = javaChannel().send(nioData, remoteAddress);
